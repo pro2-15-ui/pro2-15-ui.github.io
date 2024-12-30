@@ -7,32 +7,47 @@
   <style>
     body {
       font-family: Arial, sans-serif;
-      margin: 20px;
-      padding: 20px;
+      margin: 0;
+      padding: 0;
       background-color: #f5f5f5;
       color: #333;
     }
+    .container {
+      max-width: 480px;
+      margin: 0 auto;
+      padding: 20px;
+      box-shadow: 0px 2px 4px rgba(0, 0, 0, 0.1);
+      background-color: #fff;
+      border-radius: 10px;
+    }
     h1 {
       color: #2a71d0;
+      text-align: center;
     }
     label {
-      font-size: 1.2em;
+      font-size: 1em;
       display: block;
-      margin-top: 10px;
+      margin-top: 15px;
     }
     input {
       width: 100%;
       padding: 10px;
-      margin: 5px 0 20px;
+      margin-top: 5px;
+      margin-bottom: 20px;
       font-size: 1em;
+      border: 1px solid #ccc;
+      border-radius: 5px;
     }
     button {
+      width: 100%;
       background-color: #2a71d0;
       color: white;
-      padding: 10px 15px;
+      padding: 12px 20px;
       font-size: 1.2em;
       border: none;
+      border-radius: 5px;
       cursor: pointer;
+      margin-top: 10px;
     }
     button:hover {
       background-color: #1f57a0;
@@ -40,27 +55,30 @@
     .result {
       margin-top: 20px;
       font-weight: bold;
+      text-align: center;
     }
   </style>
 </head>
 <body>
-  <h1>DLink 初期設定</h1>
-  <form id="dataForm">
-    <label for="weight">体重（Kg）:</label>
-    <input type="number" id="weight" placeholder="例: 60" required>
+  <div class="container">
+    <h1>DLink 初期設定</h1>
+    <form id="dataForm">
+      <label for="weight">体重（Kg）:</label>
+      <input type="number" id="weight" placeholder="例: 60" required>
 
-    <label for="age">年齢:</label>
-    <input type="number" id="age" placeholder="例: 25" required>
+      <label for="age">年齢:</label>
+      <input type="number" id="age" placeholder="例: 25" required>
 
-    <label for="wakeTime">起床時刻 (99:99):</label>
-    <input type="time" id="wakeTime" required>
+      <label for="wakeTime">起床時刻 (99:99):</label>
+      <input type="time" id="wakeTime" required>
 
-    <label for="sleepTime">就寝時刻 (99:99):</label>
-    <input type="time" id="sleepTime" required>
+      <label for="sleepTime">就寝時刻 (99:99):</label>
+      <input type="time" id="sleepTime" required>
 
-    <button type="button" onclick="calculateAndSend()">送信</button>
-  </form>
-  <div class="result" id="result"></div>
+      <button type="button" onclick="calculateAndSend()">送信</button>
+    </form>
+    <div class="result" id="result"></div>
+  </div>
 
   <script>
     async function calculateAndSend() {
