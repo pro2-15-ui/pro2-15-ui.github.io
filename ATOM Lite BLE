@@ -1,0 +1,88 @@
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <ArduinoJson.h>
+
+#define SERVICE_UUID        "a4e77f8b-f5df-4f25-9b3c-d769b7d20f47"
+#define CHARACTERISTIC_UUID "c04a8b1d-6f6c-4973-947b-c5e6a342a34e"
+
+BLECharacteristic *pCharacteristic;
+BLEAdvertising *pAdvertising; // アドバタイジングを保持するための変数
+bool deviceConnected = false;
+
+// BLEサーバーのコールバック
+class MyServerCallbacks : public BLEServerCallbacks {
+    void onConnect(BLEServer* pServer) override {
+        deviceConnected = true;
+        Serial.println("[DEBUG] Device connected!");
+    }
+
+    void onDisconnect(BLEServer* pServer) override {
+        deviceConnected = false;
+        Serial.println("[DEBUG] Device disconnected! Restarting advertising...");
+        pAdvertising->start(); // 切断後に再度アドバタイジングを開始
+    }
+};
+
+// キャラクタリスティックのコールバック
+class MyCallbacks : public BLECharacteristicCallbacks {
+    void onWrite(BLECharacteristic *pCharacteristic) override {
+        String value = pCharacteristic->getValue().c_str();
+        if (value.length() > 0) {
+            Serial.println("[DEBUG] Received data via BLE:");
+            Serial.println(value);
+
+            // JSONパース
+            StaticJsonDocument<200> doc;
+            DeserializationError error = deserializeJson(doc, value);
+            if (!error) {
+                float dailyWater = doc["dailyWater"];
+                String wakeTime = doc["wakeTime"];
+                Serial.print("[DEBUG] 1日に飲むべき量: ");
+                Serial.println(dailyWater);
+                Serial.print("[DEBUG] 起床時刻: ");
+                Serial.println(wakeTime);
+            } else {
+                Serial.println("[DEBUG] Failed to parse JSON!");
+            }
+        }
+    }
+};
+
+void setup() {
+    Serial.begin(115200);
+    Serial.println("[DEBUG] Starting BLE setup...");
+
+    // BLEデバイスを初期化
+    BLEDevice::init("ATOM Lite");
+    BLEServer *pServer = BLEDevice::createServer();
+    pServer->setCallbacks(new MyServerCallbacks());
+
+    // サービスとキャラクタリスティックを設定
+    BLEService *pService = pServer->createService(SERVICE_UUID);
+
+    pCharacteristic = pService->createCharacteristic(
+        CHARACTERISTIC_UUID,
+        BLECharacteristic::PROPERTY_WRITE
+    );
+
+    pCharacteristic->setCallbacks(new MyCallbacks());
+    pService->start();
+
+    // アドバタイジングの設定
+    pAdvertising = BLEDevice::getAdvertising();
+    pAdvertising->addServiceUUID(SERVICE_UUID);
+    pAdvertising->start();
+
+    Serial.println("[DEBUG] BLE advertising started...");
+}
+
+void loop() {
+    // BLE接続状態のデバッグ情報を定期的に出力
+    if (deviceConnected) {
+        Serial.println("[DEBUG] Device connected, waiting for data...");
+    } else {
+        Serial.println("[DEBUG] Waiting for connection...");
+    }
+    delay(2000);
+}
+
