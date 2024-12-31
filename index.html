@@ -113,7 +113,7 @@
 
       try {
         const device = await navigator.bluetooth.requestDevice({
-          filters: [{ name: 'ATOM Lite' }],
+          acceptAllDevices: true,
           optionalServices: ['a4e77f8b-f5df-4f25-9b3c-d769b7d20f47']
         });
         const server = await device.gatt.connect();
