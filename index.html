@@ -94,6 +94,13 @@
   </div>
 
   <script>
+if (!navigator.bluetooth) {
+  alert("お使いのブラウザではWeb Bluetoothがサポートされていません。");
+} else {
+  console.log("Web Bluetoothをサポートしています。");
+}
+
+    
     // デバッグログをページ上に表示
     function debugLog(message) {
       const logDiv = document.getElementById("debug-log");
@@ -133,9 +140,12 @@
 
       try {
         const device = await navigator.bluetooth.requestDevice({
-          acceptAllDevices: true,
+          filters: [
+            　　　　{ services: ['a4e77f8b-f5df-4f25-9b3c-d769b7d20f47'] }
+                   ],
           optionalServices: ['a4e77f8b-f5df-4f25-9b3c-d769b7d20f47']
-        });
+          });
+
         debugLog("デバイスに接続中...");
         const server = await device.gatt.connect();
         debugLog("接続完了！");
