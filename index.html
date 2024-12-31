@@ -59,6 +59,16 @@
       font-weight: bold;
       text-align: center;
     }
+    #debug-log {
+      white-space: pre-wrap;
+      background: #f5f5f5;
+      padding: 10px;
+      margin-top: 20px;
+      border: 1px solid #ddd;
+      border-radius: 5px;
+      max-height: 200px;
+      overflow-y: scroll;
+    }
   </style>
 </head>
 <body>
@@ -80,9 +90,16 @@
       <button type="button" onclick="calculateAndSend()">送信</button>
     </form>
     <div class="result" id="result"></div>
+    <div id="debug-log"></div>
   </div>
 
   <script>
+    // デバッグログをページ上に表示
+    function debugLog(message) {
+      const logDiv = document.getElementById("debug-log");
+      logDiv.innerText += `${message}\n`;
+    }
+
     async function calculateAndSend() {
       const weight = parseFloat(document.getElementById("weight").value);
       const age = parseInt(document.getElementById("age").value, 10);
@@ -111,20 +128,26 @@
 
       const data = JSON.stringify({ dailyWater, wakeTime });
 
+      // デバッグログに送信データを表示
+      debugLog(`送信データ: ${data}`);
+
       try {
         const device = await navigator.bluetooth.requestDevice({
           acceptAllDevices: true,
-          optionalServices: ['a4e77f8b-f5df-4f25-9b3c-d769b7d20f47']
+          optionalServices: ['12345678-1234-5678-1234-56789abcdef0']
         });
+        debugLog("デバイスに接続中...");
         const server = await device.gatt.connect();
-        const service = await server.getPrimaryService('a4e77f8b-f5df-4f25-9b3c-d769b7d20f47');
-        const characteristic = await service.getCharacteristic('c04a8b1d-6f6c-4973-947b-c5e6a342a34e');
+        debugLog("接続完了！");
+
+        const service = await server.getPrimaryService('12345678-1234-5678-1234-56789abcdef0');
+        const characteristic = await service.getCharacteristic('abcdef01-1234-5678-1234-56789abcdef0');
 
         const encoder = new TextEncoder();
         await characteristic.writeValue(encoder.encode(data));
-        alert("データが送信されました！");
+        debugLog("データが送信されました！");
       } catch (error) {
-        console.error("データ送信エラー:", error);
+        debugLog(`エラー: ${error.message}`);
         alert("データ送信に失敗しました。");
       }
     }
