@@ -134,14 +134,14 @@
       try {
         const device = await navigator.bluetooth.requestDevice({
           acceptAllDevices: true,
-          optionalServices: ['12345678-1234-5678-1234-56789abcdef0']
+          optionalServices: ['a4e77f8b-f5df-4f25-9b3c-d769b7d20f47']
         });
         debugLog("デバイスに接続中...");
         const server = await device.gatt.connect();
         debugLog("接続完了！");
 
-        const service = await server.getPrimaryService('12345678-1234-5678-1234-56789abcdef0');
-        const characteristic = await service.getCharacteristic('abcdef01-1234-5678-1234-56789abcdef0');
+        const service = await server.getPrimaryService('a4e77f8b-f5df-4f25-9b3c-d769b7d20f47');
+        const characteristic = await service.getCharacteristic('c04a8b1d-6f6c-4973-947b-c5e6a342a34e');
 
         const encoder = new TextEncoder();
         await characteristic.writeValue(encoder.encode(data));
