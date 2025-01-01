@@ -1,0 +1,247 @@
+#include <M5Atom.h>
+#include <WiFi.h>
+#include <WebServer.h>
+
+// アクセスポイント設定
+const char ssid_AP[] = "logikara";
+const char pass_AP[] = "atomlite";
+
+// サーバー設定ポート80で接続
+WebServer server(80);
+
+// 初期設定HTML
+const char initialSettingsHTML[] = R"rawliteral(
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>初期設定</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      margin: 0;
+      padding: 0;
+      background-color: #f5f5f5;
+      color: #333;
+    }
+    .container {
+      max-width: 480px;
+      margin: 0 auto;
+      padding: 20px;
+      box-shadow: 0px 2px 4px rgba(0, 0, 0, 0.1);
+      background-color: #fff;
+      border-radius: 10px;
+    }
+    h1 {
+      color: #2a71d0;
+      text-align: center;
+    }
+    label {
+      font-size: 1em;
+      display: block;
+      margin-top: 15px;
+    }
+    input {
+      width: 100%;
+      padding: 10px;
+      margin-top: 5px;
+      margin-bottom: 20px;
+      font-size: 1em;
+      border: 1px solid #ccc;
+      border-radius: 5px;
+      box-sizing: border-box;
+    }
+    button {
+      display: block;
+      width: 100%;
+      background-color: #2a71d0;
+      color: white;
+      padding: 12px 20px;
+      font-size: 1.2em;
+      border: none;
+      border-radius: 5px;
+      cursor: pointer;
+      margin-top: 10px;
+    }
+    button:hover {
+      background-color: #1f57a0;
+    }
+    .result {
+      margin-top: 20px;
+      font-weight: bold;
+      text-align: center;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>初期設定</h1>
+    <form action="/submit-settings" method="POST">
+      <label for="weight">体重（Kg）:</label>
+      <input type="number" id="weight" name="weight" placeholder="例: 60" required>
+
+      <label for="age">年齢:</label>
+      <input type="number" id="age" name="age" placeholder="例: 25" required>
+
+      <label for="wakeTime">起床時刻 :</label>
+      <input type="time" id="wakeTime" name="wakeTime" required>
+
+      <label for="sleepTime">就寝時刻 :</label>
+      <input type="time" id="sleepTime" name="sleepTime" required>
+
+      <button type="submit">送信</button>
+    </form>
+    <div class="result" id="result"></div>
+  </div>
+</body>
+</html>
+)rawliteral";
+
+// WiFi設定HTML
+const char wifiSettingsHTML[] = R"rawliteral(
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Wi-Fi設定</title>
+</head>
+<body>
+  <h1>Wi-Fi設定</h1>
+  <form action="/send" method="GET">
+    <label for="ssid">SSID:</label>
+    <input type="text" id="ssid" name="ssid" placeholder="WiFi SSID" required><br>
+    <label for="password">Password:</label>
+    <input type="password" id="password" name="password" placeholder="WiFi Password" required><br><br>
+    <button type="submit" style="height:50px">送信</button>
+  </form>
+</body>
+</html>
+)rawliteral";
+
+void handleRoot() {
+  server.send(200, "text/html", wifiSettingsHTML);
+}
+
+void handleSend() {
+  String ssid = server.arg("ssid");
+  String password = server.arg("password");
+
+  Serial.println("SSID and Password received:");
+  Serial.println("SSID: " + ssid);
+  Serial.println("Password: " + password);
+
+  WiFi.begin(ssid.c_str(), password.c_str());
+  Serial.println("Connecting to Wi-Fi...");
+
+  M5.dis.drawpix(0, CRGB::Orange);
+
+  int retry = 0;
+  while (WiFi.status() != WL_CONNECTED && retry < 20) {
+    delay(500);
+    Serial.print(".");
+    retry++;
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nConnected!");
+    Serial.println("IP address: " + WiFi.localIP().toString());
+    M5.dis.drawpix(0, CRGB::Green);
+
+    server.send(200, "text/html", initialSettingsHTML);
+  } else {
+    Serial.println("\nFailed to connect to Wi-Fi.");
+    M5.dis.drawpix(0, CRGB::Red);
+
+    String response = R"rawliteral(
+    <!DOCTYPE html>
+    <html lang="ja">
+    <head>
+      <meta charset="UTF-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1.0">
+      <title>Wi-Fi接続失敗</title>
+    </head>
+    <body>
+      <h1>Wi-Fi接続に失敗しました</h1>
+      <a href='/'>戻る</a>
+    </body>
+    </html>
+    )rawliteral";
+
+    server.send(200, "text/html", response);
+  }
+}
+
+void handleSubmitSettings() {
+  float weight = server.arg("weight").toFloat();
+  int age = server.arg("age").toInt();
+  String wakeTime = server.arg("wakeTime");
+  String sleepTime = server.arg("sleepTime");
+
+  Serial.printf("Received settings:\n体重: %.2f\n年齢: %d\n起床時刻: %s\n就寝時刻: %s\n",
+                weight, age, wakeTime.c_str(), sleepTime.c_str());
+
+  int wakeHours = wakeTime.substring(0, 2).toInt();
+  int wakeMinutes = wakeTime.substring(3).toInt();
+  int sleepHours = sleepTime.substring(0, 2).toInt();
+  int sleepMinutes = sleepTime.substring(3).toInt();
+
+  int wakeInMinutes = wakeHours * 60 + wakeMinutes;
+  int sleepInMinutes = sleepHours * 60 + sleepMinutes;
+  int awakeTime = (sleepInMinutes - wakeInMinutes + 1440) % 1440;
+
+  int coefficient = age >= 70 ? 30 : 40;
+  float dailyWater = weight * coefficient;
+
+  // HTMLの作成（通常の文字列形式に変更）
+  String resultHTML = 
+    "<!DOCTYPE html>"
+    "<html lang='ja'>"
+    "<head>"
+    "  <meta charset='UTF-8'>"
+    "  <meta name='viewport' content='width=device-width, initial-scale=1.0'>"
+    "  <title>送信完了</title>"
+    "</head>"
+    "<body>"
+    "  <h1>送信完了</h1>"
+    "  <p>1日に飲むべき量: " + String(dailyWater) + " ml</p>"
+    "  <p>起きている時間: " + String(awakeTime / 60) + " 時間 " + String(awakeTime % 60) + " 分</p>"
+    "  <a href='/'>戻る</a>"
+    "</body>"
+    "</html>";
+
+  // HTMLを送信
+  server.send(200, "text/html", resultHTML);
+
+  // デバッグ出力
+  Serial.printf("1日に飲むべき量: %.2f ml\n", dailyWater);
+  Serial.printf("起きている時間: %d 時間 %d 分\n", awakeTime / 60, awakeTime % 60);
+}
+
+
+void setup() {
+  M5.begin(true, false, true);
+  Serial.begin(115200);
+
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.softAP(ssid_AP, pass_AP);
+
+  server.on("/", handleRoot);
+  server.on("/send", handleSend);
+  server.on("/submit-settings", HTTP_POST, handleSubmitSettings);
+  server.begin();
+
+  Serial.printf("\nAP Mode SSID: %s\n", ssid_AP);
+  Serial.printf("AP Mode PASS: %s\n", pass_AP);
+  Serial.print("AP Mode IP address: ");
+  Serial.println(WiFi.softAPIP());
+
+  M5.dis.drawpix(0, CRGB(20, 20, 20));
+  pinMode(21, OUTPUT);
+}
+
+void loop() {
+  server.handleClient();
+  delay(200);
+}
