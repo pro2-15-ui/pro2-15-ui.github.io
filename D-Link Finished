@@ -1,0 +1,1303 @@
+#include <M5Atom.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <Wire.h>
+#include <WiFiClientSecure.h>
+#include <WiFiUdp.h>
+#include <NTPClient.h>
+#include "UNIT_SCALES.h"
+#include <FastLED.h>
+#include <driver/ledc.h >
+#include "HardwareSerial.h"
+#include "DFRobotDFPlayerMini.h"
+
+// フルカラーLED設定
+#define PL9823_PIN       21    // フルカラーLEDのピン★
+#define NUM_PL9823_LEDS  1     // フルカラーLEDの個数
+CRGB pl9823[NUM_PL9823_LEDS];  // フルカラーLED配列
+
+// マルチタスク対応（LED制御用共有変数）；フルカラーLED（潤いLED）用
+bool ledBlinkCondition = false;   // 点滅条件
+CRGB ledColor = CRGB::Green;      // 初期色
+unsigned long blinkStartTime = 0; // 点滅開始時間（タイマー用）
+unsigned long blinkDuration = 0;  // 点滅継続時間
+// マルチタスク対応（タスクハンドル）
+TaskHandle_t LedTaskHandle = NULL;
+
+// LED制御タスク
+void LedTask(void *pvParameters) {
+  while (true) {
+    // 点滅が有効かつ時間制限がある場合、時間経過をチェック
+    if (ledBlinkCondition && blinkStartTime > 0) {
+      unsigned long elapsedTime = millis() - blinkStartTime;
+      if (elapsedTime >= blinkDuration) { // 指定された時間が経過したら点灯状態に戻す
+        ledBlinkCondition = false;
+        blinkStartTime = 0;  // タイマーをリセット
+        blinkDuration = 0;   // 継続時間をリセット
+      }
+    }
+
+    // 点滅または点灯の制御
+    if (ledBlinkCondition) {
+      pl9823[0] = ledColor;
+      FastLED.show();
+      delay(300);
+      pl9823[0] = CRGB::Black; // 消灯
+      FastLED.show();
+      delay(300);
+    } else {
+      pl9823[0] = ledColor; // 点灯状態
+      FastLED.show();
+      delay(100); // 安定動作のための短い待機
+    }
+  }
+}
+
+// OSB LED設定
+#define NUM_OSB_LEDS     3     // OSB LEDの個数★
+const int OSB_LEDS[NUM_OSB_LEDS] = {25, 22, 19}; // GPIOピン配列★
+#define OSB_FREQ         5000  // PWM周波数
+#define OSB_RESOLUTION   LEDC_TIMER_8_BIT // PWM分解能 (8ビット)
+
+// 音声LSD
+#define RXD2 33 // Connects to module's RX
+#define TXD2 23 // Connects to module's TX
+
+HardwareSerial dfSD(1); // Use UART channel 1
+DFRobotDFPlayerMini player;//DFPlayerMini定義
+const int DEFAULT_VOLUME = 5;
+
+// 音声種類
+#define SOUND_LEVEL_ZERO    0
+#define SOUND_LEVEL_LOW     1
+#define SOUND_LEVEL_MIDDLE  2
+#define SOUND_LEVEL_HIGH    3
+#define SOUND_LEVEL_MAX     4
+#define SOUND_STAY_HOME     5
+#define SOUND_GOING_OUT     6
+#define SOUND_COMPLETE_DAY  7
+
+// 重量測定オブジェクトの作成
+UNIT_SCALES scales;
+
+// アクセスポイント設定（ATOMLITEのWiFi接続用）
+const char ssid_AP[] = "D-Link WiFi";
+const char pass_AP[] = "D-LinkPass";
+
+// アクセスポイント設定（利用者のWiFi環境接続テスト用）
+//const char test_ssid[] = "9425"; // ★テスト用SSID
+//const char test_pass[] = "YutoOtsuka"; // ★テスト用PASS
+//const char test_ssid[] = "大塚達のiPhoneSE"; // ★テスト用SSID(その２)
+//const char test_pass[] = "IOas-DVoR-K3Jc-NEhO"; // ★テスト用PASS(その２)
+const char test_ssid[] = "aterm-3ab326-a"; // ★テスト用SSID(自宅WIFI) (2.4GHz）
+const char test_pass[] = "763c7a635bd88"; // ★テスト用PASS(自宅WIFIのPASS) (2.4GHz）
+//const char test_ssid[] = "aterm-3ab326-a"; // ★テスト用SSID(大学WIFI) 
+//const char test_pass[] = "763c7a635bd88"; // ★テスト用PASS(大学WIFIのPASS)
+
+// LineNotify環境
+#define LINE_NOTIFY_DEBUG  0  //★ 1を指定するとLINE通知しない。1以外の数字の場合（例：0）、LINE通知する
+const char host[] = "notify-api.line.me";
+const char test_token[] = "ozf3Gp6vh9TxkOpGWtjjjUX4vr2XCe528eJEicFMgPl"; // ★テスト用トークン
+String token = "";
+unsigned long previousMillis = 0; // 最後にLINE Notifyを送信した時刻
+const long LINE_NOTIFY_INTERVAL = 30 * 1000; // テスト30秒間隔 ★本番 30分間隔（ミリ秒）
+
+// ATOMLITEボタンの状態
+const int MODE_STAY_HOME = 1; //在宅モード（音声、LINE通知：ON）
+const int MODE_GOING_OUT = 2; //外出モード（音声、LINE通知：OFF）
+int DLink_Mode = 1;     // モードの管理（外出もしくは在宅）初期値は在宅モード
+
+// サーバー設定ポート80で接続
+WebServer server(80);
+
+// Wi-Fi接続オブジェクト
+WiFiUDP udp;
+
+// NTPサーバー設定
+const char timeServer[] = "ntp.nict.jp";  // NTPサーバー
+const long utcOffsetInSeconds = 3600 * 9;    // UTCオフセット（日本時間の場合は+3600秒 * 9時間）
+
+// NTPクライアントオブジェクト
+NTPClient timeClient(udp, timeServer, utcOffsetInSeconds);
+
+// 状態管理
+#define WAITING_FOR_CONTAINER 0
+#define HOLDING_CONTAINER     1
+#define DRINKING              2
+int currentState = WAITING_FOR_CONTAINER; // 初期状態
+
+float initialWeight = 0.0; // コップが置かれたときの重さ
+float finalWeight = 0.0;   // 飲んだ後の重さ
+float prevWeight = 0.0;    // 前回の重さ
+
+unsigned long lastDrinkTime = 0;       // 最後に飲んだ時刻
+unsigned long lastHydrationCheck = 0;  // 潤いレベルをチェックした時刻
+unsigned long lastLEDUpdateTime = 0;   // 最後にLEDを変更した時刻
+
+int currentLevel = 0; // 初期潤いレベル
+int preLevel = -1; // 直前の潤いレベル
+
+const int HYDRATION_CHECK_INTERVAL  = 60 * 1000 * 0.5;    // テスト30秒間隔　★本番　潤いレベルの更新　10分
+const int LAST_WATER_CONSUMED_DECREACE = 60 * 1000 * 3; // テスト3分間隔　★本番　潤いレベルを6~0にする間隔　60分
+const int HYDRATION_CHECK_INTERVAL2 = 900000;           // 潤いレベルの更新間隔（15分間）
+const int BASE_BLINK_DURATION = 7000;                   // 基本の点滅時間（7秒）
+const int ALERT_BLINK_DURATION = 7000;                  // 一定レベル以下での点滅時間（7秒）
+const int GOING_OUT_BLINK_DURATION = 24 * 3600 * 1000 * 7; // 外出モードでの点滅時間（無限だが実態は5日分の秒）
+
+const float WEIGHT_CHANGE_THRESHOLD = 10.0;       // 重さの変化しきい値（10g）
+float MAX_WATER_CONSUMED = 200.0;           // 利用者の推奨飲料量（テストでは200ml）
+const float WEIGHT_STABILITY_THRESHOLD = 5.0;     // コップを置くと判断する安定範囲（5g）
+const float SIGNIFICANT_WEIGHT_DIFFERENCE = 30.0; // 大幅な重さの差（30g）
+const float ADDED_MORE_WATER = 100.0;             // 継ぎ足しを判断する増加量（100ml）
+
+CRGB currentColor = CRGB::Red; // 現在のLED色（潤いレベル用、初期値はレベル0の為、赤）
+
+// 1日の飲んだ量を追跡するための変数
+float totalWaterConsumed = 0.0; // 一日の飲んだ量
+float lastWaterConsumed = 0.0;  // 前回飲んだ量（単位時間当たり）
+float waterConsumed = 0.0; // 今回飲んだ量
+unsigned long zeroLevelDuration = 0; // Lv0が続いていた時間（ミリ秒）
+unsigned long lastZeroLevelTime = 0; // 最後にLv0で更新した時刻（ミリ秒）
+const long LINE_NOTIFY_ZEROLEVEL = 60 * 1000 * 3; // テスト2分間隔 ★本番 20分間隔（ミリ秒）
+
+// 今日1日終わったかどうか
+int finishedFlag = 0;
+String DrinkingDate = ""; // 1回でもやった日付を記憶（翌日になったらリセットするため）
+String DrinkingNewDate = ""; // 1回でもやった日付の翌日
+
+
+// 翌日を計算してセット
+void updateDates() {
+  timeClient.update();
+  time_t currentTime = timeClient.getEpochTime();
+
+  // 今日の日付を計算
+  struct tm* timeInfo = localtime(&currentTime);
+  char todayBuffer[11];
+  strftime(todayBuffer, sizeof(todayBuffer), "%Y-%m-%d", timeInfo);
+  DrinkingDate = String(todayBuffer);
+
+  // 翌日の日付を計算
+  currentTime += 24 * 3600; // 1日（86400秒）を加算
+  timeInfo = localtime(&currentTime);
+  char nextDayBuffer[11];
+  strftime(nextDayBuffer, sizeof(nextDayBuffer), "%Y-%m-%d", timeInfo);
+  DrinkingNewDate = String(nextDayBuffer);
+}
+
+// 設定画面HTML
+const char initialSettingsHTML[] = R"rawliteral(
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>詳細設定</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      margin: 0;
+      padding: 0;
+      background-color: #f5f5f5;
+      color: #333;
+    }
+    .container {
+      max-width: 480px;
+      margin: 0 auto;
+      padding: 20px;
+      box-shadow: 0px 2px 4px rgba(0, 0, 0, 0.1);
+      background-color: #fff;
+      border-radius: 10px;
+    }
+    h1 {
+      color: #2a71d0;
+      text-align: center;
+    }
+    label {
+      font-size: 1em;
+      display: block;
+      margin-top: 15px;
+    }
+    input {
+      width: 100%;
+      padding: 10px;
+      margin-top: 5px;
+      margin-bottom: 20px;
+      font-size: 1em;
+      border: 1px solid #ccc;
+      border-radius: 5px;
+      box-sizing: border-box;
+    }
+    button {
+      display: block;
+      width: 100%;
+      background-color: #2a71d0;
+      color: white;
+      padding: 12px 20px;
+      font-size: 1.2em;
+      border: none;
+      border-radius: 5px;
+      cursor: pointer;
+      margin-top: 10px;
+    }
+    button:hover {
+      background-color: #1f57a0;
+    }
+    .result {
+      margin-top: 20px;
+      font-weight: bold;
+      text-align: center;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>詳細設定</h1>
+    <form action="/submit-settings" method="POST">
+      <label for="weight">体重（Kg）:</label>
+      <input type="number" id="weight" name="weight" placeholder="例: 60" required>
+
+      <label for="age">年齢:</label>
+      <input type="number" id="age" name="age" placeholder="例: 25" required>
+
+      <label for="wakeTime">起床時刻 :</label>
+      <input type="time" id="wakeTime" name="wakeTime" required>
+
+      <label for="sleepTime">就寝時刻 :</label>
+      <input type="time" id="sleepTime" name="sleepTime" required>
+
+      <button type="submit">送信</button>
+    </form>
+    <div class="result" id="result"></div>
+  </div>
+</body>
+</html>
+)rawliteral";
+
+// WiFi設定HTML
+const char wifiSettingsHTML[] = R"rawliteral(
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Wi-Fi設定</title>
+</head>
+<body>
+  <h1>Wi-Fi設定</h1>
+  <form action="/send" method="GET">
+    <label for="ssid">SSID:</label>
+    <input type="text" id="ssid" name="ssid" placeholder="WiFi SSID" required><br><br>
+    <label for="password">Password:</label>
+    <input type="password" id="password" name="password" placeholder="WiFi Password" required><br><br>
+    <label for="line_token">Lineのトークン:</label>
+    <input type="text" id="line_token" name="line_token" placeholder="xxxxxxxxxx" required><br><br>
+    <button type="submit" style="height:50px">送信</button>
+  </form>
+</body>
+</html>
+)rawliteral";
+
+// LINE Notify処理関数
+void Line_notify(String msg) {
+
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WIFI未接続のため、LINE通知しません。");
+    return;
+  }
+
+  // LINE通知をONしている場合だけ処理をする
+  if (LINE_NOTIFY_DEBUG != 1) {
+
+    WiFiClientSecure client; // https接続
+    client.setInsecure();
+    if (!client.connect(host, 443)) {
+      //Serial.println(" Line Notify disconnect!!");
+      return;
+    } else {
+      //Serial.print(" Line Notify connected...");
+    }
+
+    String query = String("message=") + msg;
+    String request = String("") +
+                   "POST /api/notify HTTP/1.1\r\n" +
+                   "Host: " + host + "\r\n" +
+                   "Authorization: Bearer " + token + "\r\n" +
+                   "Content-Length: " + String(query.length()) + "\r\n" +
+                   "Content-Type: application/x-www-form-urlencoded\r\n\r\n" +
+                   query + "\r\n";
+    client.print(request);
+    client.stop();
+  }
+
+}
+
+// 時刻をチェックする関数（現在時刻、就寝時刻、何分後の３つの引数を指定して判断する）
+bool shouldSendMessage(String currentTime, String sleepTime, int offsetMinutes) {
+  // 現在時刻を分に変換
+  int currentHours = currentTime.substring(0, 2).toInt();
+  int currentMinutes = currentTime.substring(3, 5).toInt();
+  int currentTotalMinutes = currentHours * 60 + currentMinutes;
+
+  // 就寝時刻を分に変換
+  String tempSleepTime = sleepTime + ":00";  // 秒を追加
+  int sleepHours = tempSleepTime.substring(0, 2).toInt();
+  int sleepMinutes = tempSleepTime.substring(3, 5).toInt();
+  int sleepTotalMinutes = sleepHours * 60 + sleepMinutes;
+
+  // SleepTimeが空ならば、即リターンする
+  if (sleepTotalMinutes == 0) {
+    Serial.println("SleepTime: " + sleepTime);
+    return false;
+  }
+
+  // 指定時間（就寝時刻+offsetMinutes）と現在時刻を比較
+  int targetTotalMinutes = (sleepTotalMinutes + offsetMinutes) % 1440;  // 1日分に収める
+
+  // 次の日に跨る場合（currentTotalMinutesがtargetTotalMinutesより前で、かつ、cross-overする）
+  if (targetTotalMinutes < sleepTotalMinutes) {
+    // 次の日に跨る場合
+    if (currentTotalMinutes >= sleepTotalMinutes || currentTotalMinutes < targetTotalMinutes) {
+      return true;  // メッセージ送信
+    }
+  } else {
+    // 同じ日内で判断
+    if (currentTotalMinutes >= targetTotalMinutes) {
+      return true;  // メッセージ送信
+    }
+  }
+  return false;  // メッセージ送信しない
+}
+
+void handleRoot() {
+  server.send(200, "text/html", wifiSettingsHTML);
+}
+
+void handleSend() {
+  String ssid = server.arg("ssid");
+  String password = server.arg("password");
+  token = server.arg("token"); // LINE Notify用トークンをセット。かなりの長い文字であるはず
+  
+  // それぞれの文字列がそれなりの長さがあるかチェックして、特定以下ならばテストトークンを設定。
+  if (ssid.length() < 3) {
+    ssid= test_ssid;
+    Serial.println("SSIDはテスト用をセットします");
+  }
+  if (password.length() < 3) {
+    password = test_pass;
+    Serial.println("PASSはテスト用をセットします");
+  }
+  if (token.length() < 20) {
+    token = test_token;
+    Serial.println("LINE Notiftyトークンはテスト用をセットします");
+  }
+
+  Serial.println("SSID and Password received:");
+  Serial.println("SSID: " + ssid);
+  Serial.println("Password: " + password);
+
+  WiFi.begin(ssid.c_str(), password.c_str());
+  Serial.println("Connecting to Wi-Fi...");
+
+  M5.dis.drawpix(0, CRGB::Orange);
+  //setLEDState(CRGB(200, 165, 0), true, GOING_OUT_BLINK_DURATION); // オレンジ、点滅
+
+  int retry = 0;
+  while (WiFi.status() != WL_CONNECTED && retry < 20) {
+    delay(1000);
+    Serial.print(".");
+    retry++;
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nConnected!");
+    Serial.println("IP address: " + WiFi.localIP().toString());
+    M5.dis.drawpix(0, CRGB::Green);
+    //setLEDState(CRGB::Green, false); // 緑、点灯
+
+    server.send(200, "text/html", initialSettingsHTML);
+
+
+  } else {
+    Serial.println("\nFailed to connect to Wi-Fi.");
+    M5.dis.drawpix(0, CRGB::Red);
+    //setLEDState(CRGB::Red, false, BASE_BLINK_DURATION); // 赤、点滅
+
+    String response = R"rawliteral(
+    <!DOCTYPE html>
+    <html lang="ja">
+    <head>
+      <meta charset="UTF-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1.0">
+      <title>Wi-Fi接続失敗</title>
+    </head>
+    <body>
+      <h2>Wi-Fi接続に失敗しました。<br>戻るをクリックして、<br>再度設定をお願いします。</h2>
+      <a href='/'>戻る</a>
+    </body>
+    </html>
+    )rawliteral";
+
+server.send(200, "text/html", response);
+}
+}
+
+float dailyWater = 0.0; // 飲むべき量
+float drinkedWater = 0.0; // 今まで飲んだ量
+String sleepTime; // 就寝時刻
+
+void handleSubmitSettings() {
+  drinkedWater = 0.0;
+
+  float weight = server.arg("weight").toFloat();
+  int age = server.arg("age").toInt();
+  String wakeTime = server.arg("wakeTime");
+  sleepTime = server.arg("sleepTime");
+
+  Serial.printf("Received settings:\n体重: %.2f\n年齢: %d\n起床時刻: %s\n就寝時刻: %s\n",
+                weight, age, wakeTime.c_str(), sleepTime.c_str());
+
+  int wakeHours = wakeTime.substring(0, 2).toInt();
+  int wakeMinutes = wakeTime.substring(3).toInt();
+  int sleepHours = sleepTime.substring(0, 2).toInt();
+  int sleepMinutes = sleepTime.substring(3).toInt();
+
+  int wakeInMinutes = wakeHours * 60 + wakeMinutes;
+  int sleepInMinutes = sleepHours * 60 + sleepMinutes;
+  int awakeTime = (sleepInMinutes - wakeInMinutes + 1440) % 1440;
+
+  int coefficient = age >= 65 ? 30 : 40;
+  dailyWater = weight * coefficient;
+
+  // HTMLの作成（通常の文字列形式に変更）
+  String resultHTML =
+    "<!DOCTYPE html>"
+    "<html lang='ja'>"
+    "<head>"
+    "  <meta charset='UTF-8'>"
+    "  <meta name='viewport' content='width=device-width, initial-scale=1.0'>"
+    "  <title>送信完了</title>"
+    "</head>"
+    "<body>"
+    "  <h1>送信完了</h1>"
+    "  <p>1日に飲むべき量: " + String(dailyWater) + " ml</p>"
+    "  <p>起きている時間: " + String(awakeTime / 60) + " 時間 " + String(awakeTime % 60) + " 分</p>"
+    "  <a href='/'>戻る</a>"
+    "</body>"
+    "</html>";
+
+  MAX_WATER_CONSUMED = dailyWater / (awakeTime / 60);
+
+  // HTMLを送信
+  server.send(200, "text/html", resultHTML);
+
+  // デバッグ出力
+  Serial.printf("1日に飲むべき量: %.2f ml\n", dailyWater);
+  Serial.printf("起きている時間: %d 時間 %d 分\n", awakeTime / 60, awakeTime % 60);
+  Serial.printf("単位時間で飲むべき量：%.2f ml\n", MAX_WATER_CONSUMED);
+
+}
+
+// 1日推奨飲料に対して1日トータルで飲んだ量を判断する（潤いレベルとは別）
+int checkDrinkedWaterStage(float drinkedWater, float dailyTarget) {
+  int result = 0;
+
+  // ステージ判断する処理（1/5ごとの閾値を計算）
+  float stageThreshold = dailyTarget / 3.0;
+
+  // 飲んだ量に応じてステージを判定
+  if (drinkedWater < stageThreshold) {
+    result = 0; // 1/3未満飲んだ（マイナスも含む）
+  } else if (drinkedWater < stageThreshold * 2) {
+    result = 1; // 1/3～2/3未満飲んだ
+  } else if (drinkedWater < stageThreshold * 3) {
+    result = 2; // 2/3～3/3未満飲んだ
+  } else if (drinkedWater >= stageThreshold * 3) {
+    result = 3; // 100％以上飲んだ（目標達成）
+  }
+  return result;
+}
+
+void updateWaterProgressLEDs_1Day() {
+  int litLEDs = 0; // 点灯するLEDの数
+
+  // 進捗率を計算
+  float progressPercentage = (totalWaterConsumed / dailyWater) * 100;
+
+  // 進捗率に基づいて点灯するLEDの数を設定
+  if (progressPercentage >= 100) {
+    litLEDs = 3; // 100%以上 → LED5個
+  } else if (progressPercentage >= 67) {
+    litLEDs = 2; // 67%～99% → LED2個
+  } else if (progressPercentage >= 34) {
+    litLEDs = 1; // 34%～66% → LED2個
+  } else if (progressPercentage >= 0) {
+    litLEDs = 0; // 1%～33% → LED1個
+  }
+
+  // LEDの点灯状態を更新
+  for (int i = 0; i < NUM_OSB_LEDS; i++) {
+    if (i < litLEDs) {
+      // 点灯: LEDの明るさを15に設定
+      ledc_set_duty(LEDC_LOW_SPEED_MODE, (ledc_channel_t)i, 15);
+    } else {
+      // 消灯: LEDの明るさを0に設定
+      ledc_set_duty(LEDC_LOW_SPEED_MODE, (ledc_channel_t)i, 0);
+    }
+    // 設定内容をHWに通達（これで光る）
+    ledc_update_duty(LEDC_LOW_SPEED_MODE, (ledc_channel_t)i);
+  }
+}
+
+// マルチタスク対応用（潤いLED）
+// 条件に応じてLED設定を変更する関数
+void setLEDState(CRGB color, bool blink, unsigned long duration = 0) {
+  // 使い方例
+  //  setLEDState(CRGB::Green, false); // 緑色で点灯
+  //  setLEDState(CRGB::Red, true, BASE_BLINK_DURATION); // 赤色で一定点滅
+  //  setLEDState(CRGB::Red, true, ALERT_BLINK_DURATION); // 赤色で長め点滅
+
+  ledColor = color;
+  ledBlinkCondition = blink;
+
+  // 点滅時間を設定（durationが0でない場合）
+  if (blink && duration > 0) {
+    blinkStartTime = millis(); // 点滅開始時間を記録
+    blinkDuration = duration;  // 点滅継続時間を設定
+  }
+}
+
+CRGB getLEDColor() {
+  if(pl9823[0] == CRGB::Black){
+    return CRGB::Red;
+  }
+  return pl9823[0];
+}
+
+void setup() {
+  M5.begin(true, false, true);
+  Serial.begin(115200);
+
+  M5.dis.drawpix(0, CRGB::White);
+  delay(1500); // 少し待機してから次の処理を実行
+
+  Serial.println("\n\n\n+++++ DLinkサービス開始 +++++");
+  Serial.println("WIFIサービスを開始します...");
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.softAP(ssid_AP, pass_AP);
+  Serial.printf("\nAP Mode SSID: %s\n", ssid_AP);
+  Serial.printf("AP Mode PASS: %s\n", pass_AP);
+  Serial.print("AP Mode IP address: ");
+  Serial.println(WiFi.softAPIP());
+
+  Serial.println("Webサービスを開始します...");
+  server.on("/", handleRoot);
+  server.on("/send", handleSend);
+  server.on("/submit-settings", HTTP_POST, handleSubmitSettings);
+  // 新たに/setupページを定義
+  server.on("/setup", HTTP_GET, []() {
+    server.send(200, "text/html", initialSettingsHTML);  // 初期設定HTMLを表示
+  });
+  server.begin();
+
+  // NTPクライアントの開始
+  Serial.println("NTPサービス連携を開始します...");
+  timeClient.begin();
+
+  M5.dis.drawpix(0, CRGB::White);
+  pinMode(21, OUTPUT);
+
+  // スケールセンサーの初期化
+  Serial.println("スケールセンサー初期化開始...");
+  while (!scales.begin(&Wire, 26, 32, DEVICE_DEFAULT_ADDR)) {
+    Serial.println("スケールセンサーに接続できません。再試行中...");
+    delay(1000);
+  }
+
+  Serial.println("ゼロ点補正を実行中...");
+  scales.setOffset(); // ゼロ点補正
+  delay(1000); // 補正の待機時間
+
+  Serial.println("スケールセンサー初期化完了。");
+
+  drinkedWater = 0.0;
+
+  // 音声LSI初期化
+  Serial.println("音声LSIを初期しています...");
+  Serial.println("音声LSIのピン番号： RX" + String(RXD2) + " TX" + String(TXD2));
+  dfSD.begin(9600, SERIAL_8N1, RXD2, TXD2);
+  delay(5000);
+  if (!player.begin(dfSD)) {
+    Serial.println("DFPlayer Miniの初期化に失敗しました");
+  }
+  Serial.println("音声ボリュームは" + String(DEFAULT_VOLUME) + "になっています");
+  player.volume(DEFAULT_VOLUME);
+  Serial.println("音声LSI初期化完了。");
+
+  // フルカラーLEDの初期化
+  Serial.println("フルカラーLEDを初期しています...");
+  Serial.println("フルカラーLEDのPIN番号：" + String(PL9823_PIN));
+  FastLED.addLeds<WS2812, PL9823_PIN, RGB>(pl9823, NUM_PL9823_LEDS);
+  Serial.println("フルカラーLEDの色補正を実行中...");
+  FastLED.setCorrection(TypicalLEDStrip); // 典型的なカラーパレット補正
+  //FastLED.setCorrection(Candle); // 暖色系に補正(が、ちょっといまいちかも）
+  FastLED.setBrightness(3); // 明るさ調整
+
+  // OSB LED PWM初期化
+  Serial.println("OSB LED PMSを初期化しています...");
+  ledc_timer_config_t timerConfig = {
+    .speed_mode = LEDC_LOW_SPEED_MODE,
+    .duty_resolution = OSB_RESOLUTION,
+    .timer_num = LEDC_TIMER_0,
+    .freq_hz = OSB_FREQ,
+    .clk_cfg = LEDC_AUTO_CLK
+  };
+  ledc_timer_config(&timerConfig);
+
+  for (int i = 0; i < NUM_OSB_LEDS; i++) {
+    ledc_channel_config_t channelConfig = {
+      .gpio_num = OSB_LEDS[i],
+      .speed_mode = LEDC_LOW_SPEED_MODE,
+      .channel = (ledc_channel_t)i,
+      .intr_type = LEDC_INTR_DISABLE,
+      .timer_sel = LEDC_TIMER_0,
+      .duty = 0,
+      .hpoint = 0
+    };
+    ledc_channel_config(&channelConfig);
+    Serial.println("OSB LEDのPIN番号：" + String(OSB_LEDS[i]));
+  }
+
+  // LED制御タスクを作成
+  xTaskCreatePinnedToCore(
+    LedTask,           // タスク関数
+    "LedTask",         // タスク名
+    4096,              // スタックサイズ
+    NULL,              // パラメータ
+    1,                 // CPU優先度
+    &LedTaskHandle,    // タスクハンドル
+    0                  // 実行するコア（2コアのうち0番か1番か）
+  );
+
+  finishedFlag = 0;
+  Serial.println(" finishedFlag: " + String(finishedFlag));
+
+  Serial.println("初期設定が完了しました");
+}
+
+void loop() {
+
+  //Serial.println("Loop先頭: finishedFlag: " + String(finishedFlag));
+  //delay(1000);
+
+  // Webサービス起動
+  server.handleClient();
+  delay(500);
+
+  //Serial.println("Webサービス起動: finishedFlag: " + String(finishedFlag));
+  //delay(1000);
+
+  // ボタン押下処理
+  handleAtomLiteButtonPressNew();
+
+  //Serial.println("ボタン押下処理: finishedFlag: " + String(finishedFlag));
+  //delay(1000);
+
+  // WIFI接続チェック（切れたら初期の白に戻す）
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("\nDLinkサービス中です....");
+    Serial.println("WiFi接続が切れています。接続してください。");
+    M5.dis.drawpix(0, CRGB(20, 20, 20)); //初期値の白にする
+    drinkedWater = 0.0;
+    delay(1500);
+
+    // 潤いLSDは白にする
+    //pl9823[0] = CRGB::White;
+    //FastLED.show(); // LEDの状態を反映
+    setLEDState(CRGB::White, false); //白、点灯
+
+  } else { // WiFi接続しているとき
+
+    //Serial.println("WiFi接続しているとき: finishedFlag: " + String(finishedFlag));
+    //delay(1000);
+
+    if (dailyWater == 0 && WiFi.status() == WL_CONNECTED) {
+      setLEDState(CRGB::Green, false); // 緑、点灯
+    }
+
+    // 初期設定が終わっていれば、いろんな処理をする
+    if (dailyWater != 0) {
+
+      // NTPサーバーから時刻を取得
+      timeClient.update();
+
+     // Serial.println("タイムサーバ時刻取得: finishedFlag: " + String(finishedFlag));
+      //delay(1000);
+
+      // 時刻の表示
+      //Serial.print(" Current time(NTP): ");
+      //Serial.println(timeClient.getFormattedTime());
+
+      // 今日と翌日の日付をセット
+      updateDates();
+      //Serial.println("  Today   : " + DrinkingDate);
+      //Serial.println("  Next Day: " + DrinkingNewDate);
+
+      // ここから重量センサ処理
+      float currentWeight = getAverageWeight();
+
+      //Serial.println("getAverageWeight()手前: finishedFlag: " + String(finishedFlag));
+      //delay(1000);
+
+      if (currentState == WAITING_FOR_CONTAINER) {
+        //Serial.println("\nDLinkサービス中です....");
+        if (currentWeight > 30.0) { // コップが置かれたと判断（閾値を緩めた）
+          Serial.print("コップが置かれました。重さ: ");
+          delay(500);
+          initialWeight = getAverageWeight();
+          Serial.println(initialWeight);
+          currentState = HOLDING_CONTAINER;
+
+          //Serial.println("WATING　 finishedFlag: " + String(finishedFlag));
+          //delay(1000);
+
+          if (currentWeight > finalWeight + SIGNIFICANT_WEIGHT_DIFFERENCE) {
+            Serial.print("めっちゃ重いので再計測します...重さ：");
+            delay(500);
+            currentWeight = getAverageWeight(); //再計測
+            initialWeight = currentWeight;
+            finalWeight = currentWeight;
+            Serial.println(initialWeight);
+          }
+        }
+
+      } else if (currentState == HOLDING_CONTAINER) {
+        if (currentWeight < initialWeight - WEIGHT_CHANGE_THRESHOLD) { // コップを持ち上げたと判断（閾値を緩めた）
+          Serial.print("コップを持ち上げました。飲んでいる可能性があります...重さ：");
+          Serial.println(currentWeight);
+          currentState = DRINKING;
+
+          // 潤いレベルをシリアルモニタに表示
+          float hydrationPercentage = (lastWaterConsumed / MAX_WATER_CONSUMED) * 100;
+          if (hydrationPercentage > 100) {
+            hydrationPercentage = 100;
+          }
+          Serial.print("現在の潤いレベル: " + String(currentLevel));
+          Serial.println("（" + String(hydrationPercentage) + "%）");
+          // 点滅を開始
+          //startBlinking(); // LED点滅開始時刻取得
+          setLEDState(getLEDColor(), true, BASE_BLINK_DURATION);
+        }
+
+        //Serial.println("HOLODING  finishedFlag: " + String(finishedFlag));
+        //delay(1000);
+
+      } else if (currentState == DRINKING) {
+        if (currentWeight > 30.0) {
+          // コップの重さが増加した場合、継ぎ足しされたと見なす
+          if (currentWeight > initialWeight + ADDED_MORE_WATER) {  // 一定量だけ増えた場合
+            Serial.println("水が継ぎ足されました。飲んだ量には加算しません...重さ：" + String(currentWeight));
+            delay(500);
+            initialWeight = getAverageWeight(); // コップの重さを再計測して再スタート
+            Serial.println("今日の飲んだ総量（ml）：" + String(totalWaterConsumed));
+            Serial.println("単時間で飲んだ量（ml）：" + String(lastWaterConsumed));
+            finalWeight = initialWeight; // 重さを元に戻して再計算
+
+            currentState = WAITING_FOR_CONTAINER; // 再びコップを待つ
+
+            // コップの重さが継ぎ足してない場合
+          } else {
+            Serial.print("コップを置きました。飲んだ量を計測中...重さ：");
+            delay(500);
+            finalWeight = getAverageWeight(); // 再計測する
+            Serial.println(finalWeight);
+
+            waterConsumed = initialWeight - finalWeight;
+            // 飲んだ量がマイナスの場合は無視する
+            if (waterConsumed > 0) {
+              totalWaterConsumed += waterConsumed; // 一日の飲んだ量を加算
+              lastDrinkTime = millis(); // 飲んだタイミングを記録
+              updateWaterProgressLEDs_1Day(); // 飲水進捗LEDの更新
+            } else {
+              Serial.println(" 飲んだ量が0か負の値となったため、飲んでないと判断しました。");
+              waterConsumed = 0;
+            }
+
+            drinkedWater = totalWaterConsumed;
+            updateHydrationLevel(waterConsumed, true); // 飲む量に基づいて潤いレベルを更新
+
+            Serial.println("★ 今回飲んだ量（ml）：" + String(waterConsumed));
+            Serial.println("今日の飲んだ総量（ml）：" + String(totalWaterConsumed));
+            Serial.println("単時間で飲んだ量（ml）：" + String(lastWaterConsumed));
+
+            currentState = WAITING_FOR_CONTAINER; // 再びコップを待つ
+          }
+        }
+      }
+      //Serial.println("DRINKING   finishedFlag: " + String(finishedFlag));
+      //delay(1000);
+
+    }
+
+    handleHydrationDecay(); // 潤いレベルの自然減少
+
+    updateWaterProgressLEDs_1Day(); // 飲水進捗LEDの更新
+
+    //handleBlinkingNew();      // 点滅処理（潤いLED用）
+
+    // ここからLINE処理
+    drinkedWater = totalWaterConsumed;
+
+    // 飲んでいる状態を確認、必要に応じてメッセージ通知
+    String line_msgs = "";
+    if ( drinkedWater > 0) {
+      // 飲んだ量の計算
+      int stage = checkDrinkedWaterStage(drinkedWater, dailyWater);
+      //Serial.println("----Stage:" + String(stage) + " finishedFlag: " + String(finishedFlag));
+      if (stage == 3 && finishedFlag == 0) {
+        line_msgs =
+          "\r\n"
+          "本日の摂取目標を達成しました！！\r\n"
+          "" + String(DrinkingDate) + "（" + String(timeClient.getFormattedTime()) + "）\r\n"
+          "　　推奨飲量：" + String(dailyWater) + " ml\r\n"    // 飲むべき量
+          "今日飲んだ量：" + String(drinkedWater) + " ml\r\n"  // 今日飲んだ量
+          "　潤いレベル：" + String(currentLevel);    // 潤いレベル
+        Line_notify(line_msgs);
+        //Serial.println(line_msgs);
+
+        // 音声再生
+        DLinkSoundPlay(SOUND_COMPLETE_DAY);
+        finishedFlag = 1;
+
+      } else if (currentLevel == 0 && finishedFlag == 0) {
+        if (zeroLevelDuration >= LINE_NOTIFY_ZEROLEVEL) {
+          // Lv0が続いていた時間（秒
+          line_msgs =
+            "\r\n"
+            "前回の水分補給からかなり経過しました。\r\n"
+            "早急な水分補給が必要な状況です。\r\n"
+            "この通知が長く続く場合は連絡を試みてください。\r\n"
+            "　　推奨飲量：" + String(dailyWater) + " ml\r\n"    // 飲むべき量
+            "今日飲んだ量：" + String(drinkedWater) + " ml\r\n"  // 今日飲んだ量
+            "　潤いレベル：" + String(currentLevel); // 潤いレベル
+          Line_notify(line_msgs);
+          //Serial.println(line_msgs);
+
+          DLinkSoundPlay(SOUND_LEVEL_ZERO);
+
+          zeroLevelDuration = 0;
+          lastZeroLevelTime = millis();
+        }
+
+      } else {
+        // LINE Notify処理（10秒置き）
+        line_msgs =
+          "\r\n（20秒間隔）"
+          "" + String(DrinkingDate) + "（" + String(timeClient.getFormattedTime()) + "）\r\n"
+          "　　　推奨飲量：" + String(dailyWater)   + " ml\r\n"  // 飲むべき量
+          "　終日飲んだ量：" + String(drinkedWater) + " ml\r\n"  // 飲んだ量
+          "　　潤いレベル：" + String(currentLevel) + "\r\n"     // 潤いレベル
+          "★今回飲んだ量：" + String(waterConsumed) + " ml";
+        //"★単時間で飲んだ量：" + String(lastWaterConsumed) + " ml";
+        //10秒経ったかをチェック
+        if (checkLineNotify() ) {
+          Line_notify(line_msgs);
+          //Serial.println(line_msgs);
+        }
+      }
+    }
+
+    //Serial.println("Line通知 1日終わり処理前: finishedFlag: " + String(finishedFlag));
+    //delay(1000);
+
+
+    // LINE Notify処理（1日の終わり報告用）
+    // 指定時間（就寝時刻+1時間）になったか確認
+    String strCurrentTime = String(timeClient.getFormattedTime());
+    //  Serial.println(" Current time(NTP): " + strCurrentTime);
+    //  Serial.println("   Sleep time(NTP): " + sleepTime);
+
+    if (shouldSendMessage(strCurrentTime, sleepTime, 60) && dailyWater > 0) {
+      String line_last_msgs =
+        "\r\n"
+        "就寝時刻から1時間が経過しました。\r\n"
+        "本日(" + String(DrinkingDate) + ")の最終レポートです！\r\n"
+        "　推奨飲量：" + String(dailyWater)   + " ml\r\n"    // 飲むべき量
+        "　飲んだ量：" + String(drinkedWater) + " ml\r\n"  // 飲んだ量
+        "潤いレベル：" + String(currentLevel); // 潤いレベル
+      Line_notify(line_msgs);
+      Serial.println(line_msgs);
+      drinkedWater = 0.0;
+      finishedFlag =   1;
+    }
+
+    //Serial.println("Line通知 リセットチェック: finishedFlag: " + String(finishedFlag));
+    //delay(1000);
+
+    // 達成してなくても、1日経ったらリセットする
+    // 現在の日付を取得
+    timeClient.update();
+    time_t currentTime = timeClient.getEpochTime();
+    struct tm* timeInfo = localtime(&currentTime);
+    char currentDateBuffer[11];
+    strftime(currentDateBuffer, sizeof(currentDateBuffer), "%Y-%m-%d", timeInfo);
+    String currentDate = String(currentDateBuffer);
+    // 日付が翌日になったか確認
+    if (currentDate == DrinkingNewDate) {
+      //Serial.println("  It's the next day!");
+      updateDates(); // 新しい日付を計算
+      //Serial.println("  New Today: " + DrinkingDate);
+      //Serial.println("  New Next Day: " + DrinkingNewDate);
+      finishedFlag = 0;
+      //Serial.println("日付翌日になった場合   finishedFlag: " + String(finishedFlag));
+      //delay(1000);
+      drinkedWater = 0.0;
+      //
+      currentState = WAITING_FOR_CONTAINER;
+      initialWeight = 0.0;
+      finalWeight = 0.0;
+      prevWeight = 0.0;
+      lastDrinkTime = 0;
+      lastHydrationCheck = 0;
+      totalWaterConsumed = 0.0; // 1日飲んだ量のリセット
+      waterConsumed = 0.0;
+      currentLevel = 0; // 初期潤いレベル（0%）
+      currentColor = CRGB::Red; // 潤いレベル用、初期値はレベル0の為、赤
+      preLevel = -1;
+      zeroLevelDuration = 0;
+
+      // 青で点滅
+      setLEDState(CRGB::Blue, true, ALERT_BLINK_DURATION);
+
+    }
+
+  //Serial.println("WiFi接続中の最後:  finishedFlag: " + String(finishedFlag));
+  //delay(1000);
+
+  // ここまでLINE処理
+
+  }
+
+//Serial.println("Loop終わり: finishedFlag: " + String(finishedFlag));
+//delay(1000);
+
+}
+
+
+float getAverageWeight() {
+  delay(1000); // 少し待つことで測定が安定
+  int samples = 100;
+  float totalWeight = 0.0;
+  for (int i = 0; i < samples; i++) {
+    totalWeight += scales.getWeight();
+  }
+  return totalWeight / samples; // 平均値を返す
+}
+
+// 潤いレベルを更新
+void updateHydrationLevel(float waterConsumed, bool isDrinkEvent) {
+
+  if (isDrinkEvent) {
+    Serial.println("[潤いレベル更新: 飲んだタイミング]");
+    // 飲んだ量を単位時間の飲水量に加算
+    lastWaterConsumed += waterConsumed;
+    lastHydrationCheck = millis(); // 更新タイミングをリセット
+  } else {
+    if(totalWaterConsumed == 0) return;
+    Serial.println("[潤いレベル更新: 時間経過]");
+    if (lastWaterConsumed > MAX_WATER_CONSUMED) {
+      lastWaterConsumed = MAX_WATER_CONSUMED;
+    }
+    // 時間経過に応じて単位時間の飲水量を減少させる
+    unsigned long elapsedTime = millis() - lastHydrationCheck;
+    float decay = (MAX_WATER_CONSUMED * elapsedTime) / LAST_WATER_CONSUMED_DECREACE ; // 1時間でMAX_WATER_CONSUMEDが0になる
+    lastWaterConsumed -= decay;
+    if (lastWaterConsumed < 0) {
+      lastWaterConsumed = 0;
+    }
+  }
+  
+  // 潤いレベルを再計算
+  preLevel = currentLevel; // 計算する前のレベルを取得
+
+  float hydrationPercentage = (lastWaterConsumed / MAX_WATER_CONSUMED) * 100;
+  if (hydrationPercentage >= 100) {
+    currentLevel = 6;
+  } else {
+    currentLevel = (int)(hydrationPercentage / (100 / 6)); // 6段階にマッピング
+  }
+  if (currentLevel > 6) currentLevel = 6; // レベル上限
+  if (currentLevel < 0) currentLevel = 0; // レベル下限
+
+  // フルカラーLEDの色を設定
+  if (currentLevel == 0){ // 超危険
+      setLEDState(CRGB::Red, true, GOING_OUT_BLINK_DURATION);
+  } else if (currentLevel <= 2) { // 危険
+      //pl9823[0] = CRGB::Red;
+      setLEDState(CRGB::Red, false);
+  } else if (currentLevel == 3) {  // 注意
+      //pl9823[0] = CRGB::Yellow;
+      setLEDState(CRGB(200, 165, 0), false); //Orage直接指定
+  } else if (currentLevel <= 5) {  // 良好
+      //pl9823[0] = CRGB::Green;
+      setLEDState(CRGB::Green, false);
+  } else if (currentLevel == 6) {  // 十分潤っている
+      //pl9823[0] = CRGB::Blue;
+      setLEDState(CRGB::Blue, false);
+  }
+  //FastLED.show(); // LED発光させる
+
+  Serial.println("---PreLevel:" + String(preLevel) + " CurrnetLevel:" + String(currentLevel));
+  // Lv0継続時間の計算
+  if (preLevel != 0 && currentLevel == 0) {
+    lastZeroLevelTime = millis(); // Lv0が初の時の時刻スナップショット記録
+    zeroLevelDuration = 0; // Lv0の継続時間をリセット
+  } else if (preLevel == 0 && currentLevel == 0) {
+    if (totalWaterConsumed > 0) {
+      zeroLevelDuration = millis() - lastZeroLevelTime; // 差分を追加登録
+    } else {
+      zeroLevelDuration = 0;
+    }
+  }
+  Serial.println("---ZeroLvDuration:" + String(zeroLevelDuration/(60*1000))+"分経過");
+
+  // 音声再生
+  // パタン１：Lv0～Lv5→LvMAXの時
+  // パタン２：Lv3→Lv2の時
+  // パタン３：Lv2→Lv1の時
+  // パタン４：Lv1→Lv0の時
+  // パタン５：Lv0～LvMAX→Lv0の時
+  // パタン６：Lv0→Lv1～Lv2の時 ★あった方がいいのでは？
+  if (preLevel != 6 && currentLevel == 6) {
+    DLinkSoundPlay(SOUND_LEVEL_MAX);
+
+  } else if (preLevel == 3 && currentLevel == 2) {
+    DLinkSoundPlay(SOUND_LEVEL_LOW);
+
+  } else if (preLevel == 2 && currentLevel == 1) {
+    DLinkSoundPlay(SOUND_LEVEL_LOW);
+
+  } else if (preLevel == 1 && currentLevel == 0) {
+    DLinkSoundPlay(SOUND_LEVEL_ZERO);
+
+  } else if (preLevel == 0 && currentLevel == 0 && zeroLevelDuration < LINE_NOTIFY_ZEROLEVEL) {
+    DLinkSoundPlay(SOUND_LEVEL_ZERO);
+
+  } else if (preLevel == 0 && (currentLevel == 1 || currentLevel == 2)) {
+    DLinkSoundPlay(SOUND_LEVEL_LOW);
+
+  }
+
+  // LINE通知（パタン１：LvMAXになった時、パタン２：Lv0になった時）
+  if (currentLevel == 6) {
+    // LvMAXになりました！！
+    // LINE通知
+    String line_msgs =
+      "\r\n"
+      "" + String(DrinkingDate) + "（" + String(timeClient.getFormattedTime()) + "）\r\n"
+      "潤いレベルが最大になりました！\r\n"
+      "　　　推奨飲量：" + String(dailyWater)   + " ml\r\n"  // 飲むべき量
+      "　終日飲んだ量：" + String(drinkedWater) + " ml\r\n"  // 飲んだ量
+      "　　潤いレベル：" + String(currentLevel) + "\r\n"     // 潤いレベル
+      "★今回飲んだ量：" + String(waterConsumed) + " ml";
+    //"★単時間で飲んだ量：" + String(lastWaterConsumed) + " ml\r\n";
+    Line_notify(line_msgs);
+    //Serial.println(line_msgs);
+
+  } else if (currentLevel == 0 && zeroLevelDuration < LINE_NOTIFY_ZEROLEVEL) {
+    // Lv0になってしまったよ！
+    String line_msgs =
+      "\r\n"
+      "" + String(DrinkingDate) + "（" + String(timeClient.getFormattedTime()) + "）\r\n"
+      "潤いレベルが０になりました！\r\n"
+      "　　　推奨飲量：" + String(dailyWater)   + " ml\r\n"  // 飲むべき量
+      "　終日飲んだ量：" + String(drinkedWater) + " ml\r\n"  // 飲んだ量
+      "　　潤いレベル：" + String(currentLevel) + "\r\n"     // 潤いレベル
+      "★今回飲んだ量：" + String(waterConsumed) + " ml";
+    //"★単時間で飲んだ量：" + String(lastWaterConsumed) + " ml\r\n";
+     Line_notify(line_msgs);
+     //Serial.println(line_msgs);
+  }
+
+  // パタン３：Lv0のままで30分たった時（ちとムズイ）
+  // 実装完了
+
+  Serial.print("現在の潤いレベル: " + String(currentLevel));
+  Serial.println("（" + String(hydrationPercentage) + "%）");
+}
+
+
+// 潤いレベルの自然減少
+void handleHydrationDecay() {
+  if (millis() - lastHydrationCheck >= HYDRATION_CHECK_INTERVAL) {
+    //if (currentLevel > 0) {
+      Serial.println("潤いレベルを再計算します（" + String(HYDRATION_CHECK_INTERVAL/60000) +"分経過）");
+      updateHydrationLevel(0, false); // 時間経過で潤いレベルを更新
+      lastHydrationCheck = millis(); // 更新タイミングをリセット
+      // startBlinking(); // 点滅開始時刻取得
+   // }
+  }
+}
+
+// 点滅処理（潤いLDE用、マルチタスク版） 消しても可
+void handleBlinkingNew() {
+
+if (totalWaterConsumed == 0) return;
+
+if (currentLevel <= 2) {
+    //pl9823[0] = CRGB::Red; // 危険
+    setLEDState(CRGB::Red, true, ALERT_BLINK_DURATION);
+} else if (currentLevel == 3) {
+    //pl9823[0] = CRGB::Yellow; // 注意
+    setLEDState(CRGB::Yellow, true, ALERT_BLINK_DURATION);
+} else if (currentLevel <= 5) {
+    //pl9823[0] = CRGB::Green; // 良好
+    setLEDState(CRGB::Green, true, BASE_BLINK_DURATION);
+} else if (currentLevel == 6) {
+    //pl9823[0] = CRGB::Blue; // 十分潤っている
+    setLEDState(CRGB::Blue, true, BASE_BLINK_DURATION);
+}
+
+}
+
+// ボタン押下によるリスタート処理
+void handleAtomLiteButtonPressNew() {
+  M5.update();
+  if (M5.Btn.wasPressed()) {
+    // MODE_STAY_HOME = 1; //在宅モード（音声、LINE通知：ON）
+    // MODE_GOING_OUT = 2; //外出モード（音声、LINE通知：OFF）
+    // モードの管理（外出もしくは在宅）をトグルで管理
+    if (DLink_Mode == MODE_STAY_HOME) {
+       Serial.println("DLink Mode: 外出モードに変更します" );
+
+       // 外出モードの音声再生
+       DLinkSoundPlay(SOUND_GOING_OUT);
+
+       // LINE通知
+       String line_msgs =
+         "\r\n"
+         "" + String(DrinkingDate) + "（" + String(timeClient.getFormattedTime()) + "）\r\n"
+        "■外出モードに変更されました。";
+      //"　　　　　推奨飲量：" + String(dailyWater)   + " ml\r\n"  // 飲むべき量
+      //"　　　終日飲んだ量：" + String(drinkedWater) + " ml\r\n"  // 飲んだ量
+      //"　　　　潤いレベル：" + String(currentLevel) + "\r\n"     // 潤いレベル
+      //"　　★今回飲んだ量：" + String(waterConsumed) + " ml\r\n"
+      //"★単時間で飲んだ量：" + String(lastWaterConsumed) + " ml\r\n";
+       Line_notify(line_msgs);
+       //Serial.println(line_msgs);
+
+       // 音声再生してからモード変更しないと再生されない
+       DLink_Mode = MODE_GOING_OUT;
+
+       //pl9823[0] = CRGB::Green;
+       //FastLED.show(); // LEDの状態を反映
+       setLEDState(CRGB(255,165,0), true, GOING_OUT_BLINK_DURATION);
+
+    } else if (DLink_Mode == MODE_GOING_OUT) {
+       Serial.println("DLink Mode: 在宅モードに変更します" );
+
+       // 先にモード変更しないと再生されない
+       DLink_Mode = MODE_STAY_HOME;
+
+       // 在宅モードの音声再生
+       DLinkSoundPlay(SOUND_STAY_HOME);
+
+       // LINE通知
+       String line_msgs =
+         "\r\n"
+         "" + String(DrinkingDate) + "（" + String(timeClient.getFormattedTime()) + "）\r\n"
+         "■在宅モードに変更されました。";
+         //"　　　　　推奨飲量：" + String(dailyWater)   + " ml\r\n"  // 飲むべき量
+         //"　　　終日飲んだ量：" + String(drinkedWater) + " ml\r\n"  // 飲んだ量
+         //"　　　　潤いレベル：" + String(currentLevel) + "\r\n"     // 潤いレベル
+         //"　　★今回飲んだ量：" + String(waterConsumed) + " ml\r\n"
+         //"★単時間で飲んだ量：" + String(lastWaterConsumed) + " ml\r\n";
+       Line_notify(line_msgs);
+       //Serial.println(line_msgs);
+
+       //pl9823[0] = CRGB::Blue;
+       //FastLED.show(); // LEDの状態を反映
+       setLEDState(CRGB::Blue, false);
+
+    }
+  }
+}
+
+bool checkLineNotify() {
+  // 送信後フラグをリセット
+  bool sendLineNotifyFlag = false;
+
+  // 外出モードならば送信しない
+  if (DLink_Mode == MODE_GOING_OUT) {
+    return sendLineNotifyFlag;
+  }
+
+  // 現在の時間（ミリ秒）
+  unsigned long currentMillis = millis();
+
+  // 時間経過を確認
+  if (currentMillis - previousMillis >= LINE_NOTIFY_INTERVAL) {
+    // 10秒経過した場合、LINE Notifyを送信
+    previousMillis = currentMillis;  // 時刻を更新
+    sendLineNotifyFlag = true;       // LINE Notify送信フラグをセット
+  }
+
+  return sendLineNotifyFlag;
+}
+
+void DLinkSoundPlay(int playlist) {
+  // 外出モードの場合、音声再生しない
+  if (DLink_Mode == MODE_GOING_OUT) {
+    Serial.println("外出モードの為、音声再生されません。Playlist：" + String(playlist));
+    return;
+  }
+
+  // 在宅モードの場合、音声再生する
+  if (DLink_Mode == MODE_STAY_HOME) {
+
+    if (playlist == SOUND_LEVEL_ZERO) {
+      Serial.println("潤いレベル０の音声再生..." );
+      player.play(5);
+      delay(2000);
+      player.play(6);
+      delay(5000);
+
+    } else if (playlist == SOUND_LEVEL_LOW){
+      Serial.println("潤いレベル低の音声再生..." );
+      player.play(1);
+      delay(2000);
+      player.play(2);
+      delay(6000);
+
+    } else if (playlist == SOUND_LEVEL_MIDDLE){
+      //Serial.println("潤いレベル中の音声再生..." );
+
+    } else if (playlist == SOUND_LEVEL_HIGH){
+      //Serial.println("潤いレベル高の音声再生..." );
+
+    } else if (playlist == SOUND_LEVEL_MAX){
+      Serial.println("潤いレベル最大の音声再生..." );
+      player.play(9);
+      delay(2000);
+      player.play(10);
+      delay(5000);
+
+    } else if (playlist == SOUND_STAY_HOME){
+      Serial.println("在宅モードの音声再生..." );
+      player.play(8);
+      delay(2000);
+
+    } else if (playlist == SOUND_GOING_OUT){
+      Serial.println("外出モードの音声再生..." );
+      player.play(7);
+      delay(2000);
+
+    } else if (playlist == SOUND_COMPLETE_DAY ){
+      Serial.println("1日の水分摂取量達成の音声再生..." );
+      player.play(3);
+      delay(2000);
+      player.play(4);
+      delay(7000);
+    }
+  }
+}  
